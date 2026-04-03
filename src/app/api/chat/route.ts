@@ -1,13 +1,5 @@
-import { createHuggingFace } from '@ai-sdk/huggingface';
-import { streamText, type CoreMessage } from 'ai';
+import { HfInference } from '@huggingface/inference';
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
-
-export const runtime = 'edge';
-
-const huggingface = createHuggingFace({
-  apiKey: process.env.HUGGING_FACE_API_KEY,
-});
 
 const systemPrompt = `You are Bernard Fiagbenu's expert portfolio assistant. Your name is "Portfolio Pro".
 Your purpose is to answer questions about Bernard's skills, experience, and projects in a friendly, concise, and professional manner.
@@ -26,7 +18,7 @@ Here is the context about Bernard Fiagbenu. Use it to answer the user's question
 - **Languages:** Python, Java, C++, JavaScript (ES6+), TypeScript, SQL, Go, Swift, Kotlin
 - **Web Development:** React, Next.js, HTML5, CSS3, Tailwind CSS, Node.js, Express.js
 - **Software Engineering:** Agile, Scrum, Git, GitHub, Design Patterns, SDLC
-- **Databases:** MySQL, PostgreSQL, MongoDB, Firebase Firestore
+- **Databases:** MySQL, PostgreSQL, MongoDB
 - **AI/ML:** Core AI Concepts, NLP, Computer Vision Basics
 - **Cloud/DevOps:** AWS, Azure, GCP concepts, Docker, CI/CD
 
@@ -45,34 +37,67 @@ Based on the context above, answer the following question.
 
 
 export async function POST(req: NextRequest) {
-  try {
-    const { messages }: { messages: CoreMessage[] } = await req.json();
+  const apiKey = process.env.HUGGING_FACE_API_KEY;
 
-    const result = await streamText({
-      model: huggingface('mistralai/Mistral-7B-Instruct-v0.2'),
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...messages,
-      ],
-      maxSteps: 3,
+  if (!apiKey) {
+    console.error('HUGGING_FACE_API_KEY is not set');
+    return NextResponse.json(
+      { error: 'AI response failed', details: 'API key is not configured. Please set HUGGING_FACE_API_KEY in your environment variables.' },
+      { status: 500 }
+    );
+  }
+
+  try {
+    const hf = new HfInference(apiKey);
+    const { messages } = await req.json();
+
+    // Build conversation for the HF model
+    const conversationMessages = [
+      { role: 'system' as const, content: systemPrompt },
+      ...messages.map((m: any) => ({ role: m.role as 'user' | 'assistant', content: m.content })),
+    ];
+
+    // Use HF Inference API for chat completion with streaming
+    const stream = hf.chatCompletionStream({
+      model: 'mistralai/Mistral-7B-Instruct-v0.3',
+      messages: conversationMessages,
+      max_tokens: 1024,
     });
 
-    return result.toAIStreamResponse({
+    // Create a ReadableStream that outputs plain text chunks
+    // compatible with the `useChat` hook from the `ai` package
+    const textEncoder = new TextEncoder();
+    const readableStream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of stream) {
+            const text = chunk.choices?.[0]?.delta?.content;
+            if (text) {
+              // Format as AI SDK data stream protocol: 0:"text"\n
+              const formattedChunk = `0:${JSON.stringify(text)}\n`;
+              controller.enqueue(textEncoder.encode(formattedChunk));
+            }
+          }
+          // Send finish reason
+          controller.enqueue(textEncoder.encode('d:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0}}\n'));
+          controller.close();
+        } catch (err: any) {
+          console.error('Streaming error:', err);
+          controller.error(err);
+        }
+      },
+    });
+
+    return new Response(readableStream, {
       headers: {
-        'Transfer-Encoding': 'chunked',
-        'Connection': 'keep-alive',
+        'Content-Type': 'text/plain; charset=utf-8',
         'Cache-Control': 'no-cache',
       },
     });
   } catch (error: any) {
-    console.error('Google API Error:', {
-      message: error.message,
-      code: error.code || 'N/A',
-      model: 'gemini-2.5-flash',
-      details: error.cause?.message || 'Run ListModels curl for your account',
-    });
+    console.error('HuggingFace API Error:', error.message);
     return NextResponse.json(
-      { error: 'AI response failed', details: error.message || 'Not Found' },
+      { error: 'AI response failed', details: error.message || 'Unknown error' },
       { status: 500 }
     );
   }
